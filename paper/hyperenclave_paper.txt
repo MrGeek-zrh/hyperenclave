@@ -1,0 +1,1178 @@
+    HyperEnclave: An Open and Cross-platform Trusted 
+                    Execution Environment
+      Yuekai Jia, Tsinghua University; Shuang Liu, Ant Group; Wenhao Wang, SKLOIS, 
+     Institute of Information Engineering, CAS, and School of Cyber Security, University 
+      of Chinese Academy of Sciences; Yu Chen, Tsinghua University; Zhengde Zhai, 
+                 Shoumeng Yan, and Zhengyu He, Ant Group
+             https://www.usenix.org/conference/atc22/presentation/jia-yuekai
+        This paper is included in the Proceedings of the 
+          2022 USENIX Annual Technical Conference.
+                    July 11–13, 2022 • Carlsbad, CA, USA
+                           978-1-939133-29-8
+                               Open access to the Proceedings of the 
+                              2022 USENIX Annual Technical Conference 
+                                       is sponsored by
+                 HyperEnclave: An OpenandCross-platformTrustedExecutionEnvironment
+                                                                                      ∗
+                                            1                2                  3,4(B)            1                  2
+                                Yuekai Jia , Shuang Liu , Wenhao Wang                  , Yu Chen , Zhengde Zhai ,
+                                                                         2                     2
+                                                       ShoumengYan ,andZhengyuHe
+                                                               1Tsinghua University
+                                                                     2Ant Group
+                                             3SKLOIS, Institute of Information Engineering, CAS
+                                  4School of Cyber Security, University of Chinese Academy of Sciences
+                                      Abstract                                that are difficult to audit, slow to evolve, and thus are inferior
+              Anumber of trusted execution environments (TEEs) have           to cryptographic alternatives (such as homomorphic encryp-
+              beenproposedbybothacademiaandindustry.However,most              tion), which are based upon public algorithms and widely
+              of them require specific hardware or firmware changes and       available hardware. Moreover, most existing TEE designs
+              are bound to specific hardware vendors (such as Intel, AMD,     restrict the enclaves (i.e., the protected TEE regions) to run
+              ARM,andIBM). In this paper, we propose HyperEnclave,            only in fixed mode.1 It is difficult to support the performance
+              an open and cross-platform process-based TEE that relies        and security requirements of various types of applications
+              on the widely-available virtualization extension to create the  that need to be protected by TEEs. For example, Intel SGX
+              isolated execution environment. In particular, HyperEnclave     enclaves run in the user mode and cannot access privileged
+              is designed to support the flexible enclave operation modes to  resources (such as the file system, the IDT, and page tables)
+              fulfill the security and performance demands undervarious en-   and process privileged events (interrupt and exceptions). As a
+              clave workloads. We provide the enclave SDK to run existing     result, running I/O-intensive and memory-demanding tasks
+              SGXprogramsonHyperEnclavewithlittleornosourcecode               leads to significant performance degradation.
+              changes. We have implemented HyperEnclave on commodity             Tofill the gap,in this paper we propose the design of Hyper-
+              AMDservers and deployed the system in a world-leading           Enclave to support confidential cloud computing that can run
+              FinTech company to support real-world privacy-preserving        securely on both legacy servers readily available in the cloud,
+              computations. The evaluation on both micro-benchmarks and       andontherisingARM(orRISC-Vinthefuture)servers,with-
+              application benchmarks shows the design of HyperEnclave         out requiring specific hardware features. For this purpose, our
+              introduces only a small overhead.                               design provides a process-based TEE abstraction using the
+                                                                              widely available virtualization extension (for isolation) and
+              1   Introduction                                                TPM(forrootoftrust and randomness etc.). To better fulfill
+                                                                              the needs for specific enclave workloads, HyperEnclave sup-
+                                                                              ports the flexible enclave operation modes, i.e., the enclaves
+              In recent years, trusted execution environments (TEEs) are      can run at different privilege levels and can have access to
+              emerging as a new form of computing paradigm, known as          certain privileged resources (see Sec. 4 for more details).
+              confidential computing, due to the high demand for privacy-     Design details. In our design, the system runs in three modes.
+              preserving data processing technologies that can handle mas-    Atrustedsoftwarelayer,calledRustMonitor(securitymonitor
+              sive data samples. TEEs provide hardware-enforced memory        written in Rust),runs in the monitor mode,whichis mappedto
+              partitions where sensitive data can be securely processed.      the VMXrootmode.RustMonitorisresponsibleforenforcing
+              Existing TEE designs support different levels of TEE abstrac-   the isolation and is part of the trusted computing base (TCB).
+              tions, such as process-based (Intel’s Software Guard eXten-     Theuntrusted OS (referred to as the primary OS) provides an
+              sions (SGX) [55]), VM-based (AMD SEV [45]), separate            execution environment for the untrusted part of applications;
+              worlds (ARMTrustZone [16]), and hybrid (Keystone [49]).         the untrusted OS and application parts run in the normal
+              Currently, the most prominent example of TEEs is Intel SGX,     mode, which is mapped to the VMX non-root mode. The
+              whichiswidelyavailable in commercial off-the-shelf (COTS)       trusted part of application (i.e., enclave) runs in the secure
+              desktop and server processors.                                  mode, which can be mapped flexibly to ring-3 or ring-0 of the
+              Motivations. Most of today’s TEE technologies are close-        VMXnon-rootmode,orring-3oftheVMXrootmode.
+              sourced and require specific hardware or firmware changes
+                                                                                 1Anexception is CURE [20], which however requires hardware changes
+                ∗Corresponding author: Wenhao Wang (wangwenhao@iie.ac.cn).    to the CPU core and the system bus to support the flexible enclaves (Sec. 9).
+              USENIX Association                                                        2022 USENIX Annual Technical Conference    437
+                 Memoryisolation is enforced with hardware-based mem-                hardware and applications, demonstrating that the proposed
+               ory protection of the memory-management unit (MMU). As                design is practical and only has a small overhead.
+              weobservethatexistingprocess-basedTEEs(e.g.,Inktag[38]
+               and Intel SGX [55]) are vulnerable to page-table-based at-          2    Background
+               tacks [74], our memory isolation scheme chooses to manage
+               the enclave’s page table and page fault events entirely by the      2.1    Trusted Execution Environment
+               trusted code, removing the involvement of the primary OS.
+              The design also prevents certain types of enclave malware            ATrusted Execution Environment (TEE) is designed to en-
+               attacks (Sec. 3.2).                                                 sure that sensitive data is stored, processed, and protected in
+                 To minimize the attack surface, we adopt an approach              an isolated and trusted environment. The isolated area could
+               called measured late launch: the primary OS kernel is first         be a separate system apart from the normal operating sys-
+               booted; then a chunk of special kernel code, implemented            tem (such as the TrustZone [16] secure world), a part of a
+               as a kernel module in the primary OS, runs to initiate Rust-        process address space (such as an Intel SGX [55] enclave),
+               Monitor in the most privileged level (i.e., the monitor mode)       or a stand-alone VM (such as a virtual machine protected
+               and demotes the primary OS to the normal mode. All booted           by AMD SEV [45] or Intel TDX [41]). To resist the privi-
+               components during the booting process are measured and ex-          leged attacker, TEE needs to thwart not only the OS-level
+               tended to the TPM Platform Configuration Registers (PCRs).          adversary but also the malicious party who has physical ac-
+               Since the TPM attestation guarantees that PCRs cannot be            cess to the platform. To this end, it offers hardware-enforced
+               rolled back, the design ensures that RustMonitor is securely        security features including isolated execution, integrity, and
+               launched; otherwise, a violation of the TPM quote would be          confidentiality protection of the enclave, along with the abil-
+               detected during remote attestation.                                 ity to authenticate the code running inside a trusted platform
+                 WehaveimplementedHyperEnclaveoncommodityAMD                       through remote attestation.
+               servers. In total RustMonitor consists of about 7,500 lines         Isolation. At the core of a TEE is the memory isolation
+               of Rust code. The APIs of our enclave SDK are compatible            scheme, which guarantees that code, data, and the runtime
+              with the official SGX SDK. As a result, code written for SGX         state of the enclave cannot be accessed or tampered with
+               couldbeeasilyportedtorunonHyperEnclavebyrecompiling                 by untrusted parties. For Intel SGX, the protected memory
+               the code with little (or no) source code changes. We have           (i.e., the enclave) is mapped to a special physical memory
+               portedanumberofSGXapplications,aswellastheRustSGX                   area called Enclave Page Cache (EPC), which is encrypted
+               SDK[71]andtheOcclumlibraryOS[64]toHyperEnclave.                     and cannot be directly accessed by other software, firmware,
+              Themicro-benchmarks show that the overheads for ECALLs               BIOS,anddirect memory access (DMA).
+               and OCALLs are < 9,700 and < 5,260 cycles respectively              Attestation. The goal of remote attestation is to generate
+              (14,432 and 12,432 cycles respectively on Intel SGX). The            an attestation quote, which includes the measurement of the
+               evaluation on a suite of real-world applications shows that the     softwarestate,signedwiththeattestationkeyembeddedinthe
+               overhead is small (e.g., the overhead on SQLite is only 5%).        hardware. The remote user verifies the validity of the quote by
+               Contributions. In summary, the paper proposes the design of         checking the signature (which reflects the hardware identity)
+               HyperEnclave, with the following contributions:                     and the measurement (which proves the software state).
+                          2
+               • Anopen andcross-platform processed-based TEE with
+                 minimumhardwarerequirements (virtualization extensions            2.2    Trusted Platform Module
+                 and TPM)that can run existing SGX programs with little
+                 or no source code changes, which enables the reuse of the         Trusted Platform Module (TPM) is both an industry-
+                 rich toolchains and ecosystem for Intel SGX.                      standard [36] and an ISO/IEC standard [4] for a secure cryp-
+               • Supporting the flexible enclave operation modes to fulfill        toprocessor. It is used by nearly all PC and server manufactur-
+                 the diverse security and performance requirements of en-          ers. Firmware TPMs (fTPMs) are firmware-based (e.g. UEFI)
+                 clave applications without hardware or firmware changes.          TPMimplementations.Atthetimeofthiswriting,Intel,AMD,
+               • Amemoryisolationschemethattheenclave’s page table                 and Qualcommall have implemented fTPMs.
+                 andpagefaultaremanagedentirelybythetrustcode,which                   TPMhasasetofPlatformConfigurationRegisters (PCRs),
+                 mitigates the page-table-based attacks and the enclave mal-       which can be used for the measurement of the booted code
+                 ware attacks.                                                     during the boot process. PCRs are reset to zero on system
+               • Ameasuredlatelaunchapproach,combinedwiththeTPM-                   reboot or power on-off. During every boot process, the PCRs
+                 based attestation to reduce the attack surface.                   can only be extended with the new measurement (called PCR
+               • Animplementation on commodity servers (mostly) using              extend), and thus cannot be set to arbitrary values.
+                 the memory safe language Rust, and an evaluation on real             Every TPMships with a unique asymmetric key, called the
+                                                                                   Endorsement Key (EK), embedded by the manufacturer as
+                 2The code will be available at https://github.com/HyperEnclave.   the root of trust. The TPM can generate a quote of the PCR
+               438    2022 USENIX Annual Technical Conference                                                               USENIX Association
+                 values,signedusingtheTPMAttestationIdentityKeys(AIK),                                          Monitor Mode             Normal Mode             Secure Mode
+                 while the AIK is generated inside TPM and certified using                                                                     ECALL
+                                                                                                          Normal VM
+                                                                                                                        App-B        App-A           Enclave-A    Enclave-B
+                  EK.Anymodifications of the booted code would be reflected                                                     ...                            ...
+                                                                                                                                    SDK uRTS          SDK tRTS     SDK tRTS
+                                                                                                                       SDK uRTS
+                  in the quote. Upon receiving the quote, the remote party can                                                                 OCALL
+                                                                                                                                  Kernel Module
+                 validate the signing key comes from an authentic TPM and                                        Primary OS
+                  can be assured that the PCR digest report has not been altered.                                                  ENCLS                ENCLU
+                                                                                                                                                             RustMonitor
+                                                                                                             Initialization & Demotion
+                  2.3     Threat Model                                                                                  Memory         Hypercall/Syscall        Enclave
+                                                                                                           vCPU
+                                                                                                                      Management            Handler          Management
+                  Like the other TEE proposals [23, 49], we trust the un-
+                  derlying hardware, including the processor establishing the
+                 virtualization-based isolation, the System Management Mode                                 CPU     RAM       EPC       Device  APIC   Disk   NIC    TPM
+                 (SMM)code,aswellastheTPM.WeassumethattheCore                                                                         Hardware
+                  Root of Trust for Measurement (CRTM) is trusted and im-                                                Figure 1: System Overview.
+                  mutable. HyperEnclave mitigates certain physical memory
+                  attacks, such as cold boot attacks and bus snooping attacks
+                 with the hardware support for memory encryption. We don’t                           ization extension. In particular, HyperEnclave is designed to
+                  fully trust the operator and assume the attacker cannot mount                      support the process-based TEE model (similar to Intel SGX)
+                  physical attacks during the boot process, i.e., we assume that                     for the following reasons.
+                  the system is initially benign (during system boot), and the
+                  early OS during the boot stage is part of the TCB. This can                        • Minimized TCB. To protect an application using the
+                  be achieved in two ways.                                                             process-based TEE, the TCB includes only the protected
+                  • Firstly, the power-on event can be secured with a hardware                         code itself, while in the other forms of TEE, much more
+                    device, such as an HSM (i.e., hardware security module).                           code must be included, such as the guest operating system
+                    Theplatform enters the boot process only with the engage-                          for VM-based TEEs.
+                    mentandsupervisionofatrustedparty,whoownstheHSM.                                 • Established ecosystem. Since Intel SGX is currently the
+                    After that, the operators for maintenance are not trusted.                         most prevalent TEE supported in the cloud (major CSPs,
+                  • Secondly, the boot process can be enhanced to defend                               including GCP, Azure, and Aliyun, provide SGX-based in-
+                    against adversaries with physical accesses. To prevent I/O                         stances [9,62]), a rich set of toolchains and applications
+                    attacks, we can harden the OS to remove unnecessary de-                            have been developed. Supporting the SGX model reduces
+                    vices and disable the DMA capability of peripherals before                         the porting effort and makes it easy to deploy confidential
+                    IOMMUis enabled. We can enable memory encryption                                   computing tasks in the cloud.
+                    at an early stage (e.g., in the BIOS, before any off-chip                        • Cloud computing trends. We have witnessed a clear trend
+                    memoryisused)toprevent physical memory attacks.                                    towards running container-based serverless applications in
+                     However, after RustMonitor is launched, the primary OS                            the cloud. Protecting these applications against untrusted
+                  is demoted to the normal mode, and can be under the control                          clouds using TEEs is important. Considering that such com-
+                  of the attacker, who may try to compromise the RustMonitor                           puting tasks are typically short-lived, and favor a short start-
+                  or enclaves, e.g., try to access the protected memory directly                       up time, maintaining a VM seems to be too heavy-weight.
+                  or through DMA. We consider the enclave code may be mali-                          In this section, we introduce HyperEnclave using x86 nota-
+                  cious or controlled by an attacker due to memory bugs. Our                         tions, as we prototyped HyperEnclave on AMD servers.
+                  design needs to prevent a compromised enclave from con-
+                  taminating the other enclaves or the RustMonitor. We also                          3.1     SystemOverview
+                  prevent the attacks against the primary OS or the application
+                  code, such as those presented in [63]. Similar to other TEEs,                      HyperEnclave supports the following modes: the monitor
+                  in this paper we do not focus on the prevention of denial of                       mode,i.e., VMX root operation mode; the normal mode for
+                  service (DoS) attacks or side channel attacks, such as cache                       the primary OS and untrusted part of applications, i.e., ring-0
+                  timing and speculative execution attacks [48].                                     andring-3 of the VMX non-root operation mode respectively;
+                                                                                                     and the secure mode for the enclave, which could be ring-3
+                  3    Design                                                                        and ring-0 of the VMX non-root operation mode, or ring-3
+                                                                                                     of the VMX root operation mode, depending on the enclave
+                  HyperEnclave is designed to support confidential cloud com-                        operation mode. We will introduce the flexible operation
+                  puting without requiring specific hardware features. There-                        modesupported by HyperEnclave in Sec. 4. As illustrated in
+                  fore, HyperEnclave is built upon the widely available virtual-                     Figure1,HyperEnclaveconsistsofthefollowingcomponents:
+                  USENIX Association                                                                             2022 USENIX Annual Technical Conference    439
+              • RustMonitor is a lightweight hypervisor running in the            clave build time and enables new enclave features, such as
+                monitor mode that manages the enclave memory, enforces            on-demandstack and heap growth, and on-demand creation
+                the memory isolation, and controls the enclave state tran-        of code pages to support just-in-time (JIT) compilation. On
+                sitions. It works as a resource monitor, while complicated        SGX2platforms, the enclaves need to send the EDMM re-
+                tasks are offloaded to the primary OS.                            quest to the SGX driver through OCALLs, who then makes
+              • RustMonitor creates a unique guest VM (referred to as the         the requested changes. Since the driver is untrusted by the
+                normal VM) that runs the primary OS (such as Linux) and           enclaves, the changes need to be explicitly checked and ac-
+                hosts the untrusted part of applications in the normal mode.      cepted by the enclaves to take effect, which involves heavy
+                The primary OS is still in charge of process scheduling           enclave mode switches.
+                and I/O devices management, but it is not trusted by the          HyperEnclavememorymanagement.Weobservethatthe
+                RustMonitor and enclaves.                                         above challenges are rooted in the fact that the enclave’s
+              • Application is the untrusted part of the application which        page table and page faults are both managed by the primary
+                runs in the primary OS.                                           OS. In HyperEnclave, though the enclave is still part of the
+              • The kernel module. We provide a kernel module in the              application’s address space,wecreateaseparatepagetablefor
+                primary OS to load, measure, and launch RustMonitor, as           the enclave and let RustMonitor manage the enclave’s page
+                well as to invoke the emulated privileged operations.             table and page fault without the involvement of the primary
+                                                                                  OS3,whilethepagetablesinthenormalVMarestillmanaged
+              • Toeasedevelopment, HyperEnclave provides an enclave               bytheprimaryOS.However,thedesignfacesnewchallenges:
+                SDK with APIs compatible with the official Intel SGX              since the enclave can access the application’s entire address
+                SDK[12],including both the untrusted runtime and trusted          space, upon a change to the mapping of the page tables in the
+                runtime (i.e., SDK uRTS and SDK tRTS). As such, most              applications, e.g, due to page swapping, the updated mapping
+                SGXprogramscanrunonHyperEnclavewithlittleorno                     needs to be synchronized to the enclave’s page table managed
+                source code changes.                                              byRustMonitor.
+              • Enclave is the trusted part of the application running in the        To eliminate the overhead for synchronization, we pre-
+                secure mode.                                                      allocate a marshalling buffer in the application’s address
+                                                                                  space, which is shared with the enclave. The mappings of
+              3.2    MemoryManagementandProtection                                the marshalling buffer are fixed during the entire enclave life
+                                                                                  cycle by pre-populating the physical memory and pinning
+              Challenges. For process-based TEEs, the enclave runs in             it in the memory. All data exchanged between the enclave
+              the user mode and is not able to manage its own page ta-            and the application must be passed through the marshalling
+              ble. Existing designs (e.g., Intel SGX, TrustVisor [54]) allow      buffer. The application’s memory mappings (except those for
+              the untrusted OS to manage the enclave’s page table. To             the marshalling buffer) are not needed by the enclave and
+              prevent memory mapping attacks (i.e., attacks by manipulat-         are not included in the enclave’s page table. Such a design
+              ing the enclave’s address mappings, as shown in Figure 9,           also mitigates the known enclave malware attacks [63], as
+              Appendix A.1), the design of SGX extends the Page Miss-             the enclave cannot access the application’s address space but
+              ing Handler (PMH) and introduces a new metadata called              the marshalling buffer (Sec. 6 for more details). We remind
+              EPCMforadditional security checks on TLB misses [32].               the attacker may manipulate the marshalling buffer, however
+              Without secure hardware support, a prevalent software solu-         it does not cause additional security issues, since the buffer
+              tion [19,54,75] is to make the page tables write-protected by       is untrusted by design where the developer is responsible to
+              setting the page table entries (PTEs) for pages holding the         ensure that the data transmitted through the buffer is authentic
+              page tables, i.e., any update to the page table traps to the hy-    and protected (same as the SGX model).
+              pervisor and then be verified. However, on x86 platforms the           When the enclave accesses a virtual address that is not
+              updates of access and dirty bits of the PTEs also trap into the     committed with a physical page (e.g., due to page swapping
+              hypervisor, leading to non-negligible overhead. Even-worse,         or EDMM), a page fault is raised and the enclave traps to
+              since the enclave page fault is also processed by the OS, the       RustMonitor. RustMonitor picks up a free page from the
+              above designs are still vulnerable to the page table-based-         enclave memory pool, inserts a new mapping to the enclave’s
+              attacks, such as the controlled-channel attacks [74].               page table, and resumes the enclave’s execution. When the
+                 Thedesign becomes more challenging to support enclave            enclave requests changing the page permissions, the enclave
+              dynamic memorymanagement(i.e., EDMMonSGX2plat-                      issues a hypercall to RustMonitor to update the permissions
+              forms [34]), i.e, dynamically adding or removing enclave            in the enclave’s page table and clear the corresponding TLB
+                                                                                         4
+              pages, or changing the enclave page attributes or types af-         entries.
+              ter the enclave is initialized. Without EDMM, all physical          HyperEnclavememoryisolation. Figure 2 shows the mem-
+              memorythattheenclave might ever use must be committed                  3P-Enclave can manage its own guest page table (Sec. 4.3).
+              before enclave initialization. Therefore, EDMM reduces en-             4P-Enclave can change the page permissions by itself (Sec. 4.3).
+              440    2022 USENIX Annual Technical Conference                                                               USENIX Association
+                                                                                                                                                                                       early               kernel space
+                                      App's code & data                  Marshalling buffer
+                                                                                                                                              bootloader     kernel space                                                       userspace
+                                                                                                                                                                                    userspace             (normal mode)
+                                      Enclave's code & data              Encrypted memory
+                                                                                                                                                                                     initramfs
+                                                                                          Memory view
+                                                                                                                                                                                    kernel module
+                                                                                                                                                               primary OS                                   primary OS          services &
+                                             Normal VM
+                                                                                                                                                 grub
+                                                                                                                                                                 kernel                                  kernel (demoted)       applications
+                                     App-B                 App-A                 Enclave-A             Enclave-B
+                                                                                                                                                                                    RustMonitor
+                                                                                                                                                                                          
+                                                                                                                                                                                      attestation key
+                                                                                                                                                                                          
+                                              ...                                                    ...
+                                             Primary OS
+                                                                                                                                                                                       TPM PCRs
+                                                                                                                                                        control flow                load & measure                  extend measurements
+                                                                                                          RustMonitor
+                                                   Normal memory                       EPC memory                                                             Figure 3: Measured Late Launch.
+                                                                                                            memory
+                                                  Figure 2: Memory isolation.
+                                                                                                                                                                enclave measurement signature (ems)
+                       ory mappings of the applications within the normal VM and                                                                                 hypervisor attestation pub key (hapk)
+                       the enclaves. The application’s memory within the normal                                                                                                   TPM_Quote
+                       VMismanagedwithnestedpaging,whiletheenclave’smem-                                                                                               digest(PCR[0-7, 8-9, 12-13])
+                       ory could be managed through nested paging or through nor-                                                                                                   signature
+                       mal1-leveladdress translation, determined by the correspond-
+                       ing operation mode (Sec. 4). As a result, HyperEnclave en-                                                                                               TPM_AK_Cert
+                       forces the following security requirements.                                                                                                            PCR[0-7, 8-9, 12]
+                       • R-1: The primary OS and applications are not allowed to                                                                                     TPM attestation pub key (tapk)
+                           access the physical memory belonging to RustMonitor and
+                           the enclaves.                                                                                                            Figure 4: The HyperEnclave quote structure.
+                       • R-2:Theenclaveisnotallowedtoaccessphysicalmemory
+                           belonging to RustMonitor and other enclaves. It is designed                                                 for each boot component, so that any modification will be
+                           to have access to only a specific memory region shared with                                                 reflected in the attestation quote.
+                           the untrusted application for parameter passing (i.e., the                                                      Toreduce the attack surface from the primary OS, we put
+                           marshalling buffer).                                                                                        the RustMonitor image into the initramfs. The kernel mea-
+                       • R-3:DMAaccessesfrommaliciousperipheralstothephys-                                                             sures the RustMonitor image and extends the value to TPM
+                           ical memory belonging to RustMonitor and the enclaves are                                                   PCRs,thenit launches RustMonitor in early userspace, i.e.,
+                           not allowed. In order to prevent such attacks, HyperEnclave                                                 before any userspace program that relies on the disk file sys-
+                           restricts the physical memory used by the peripherals with                                                  tem starts to run. Along with the measured boot, it ensures
+                           the support of the Input-Output Memory Management Unit                                                      that the software state when RustMonitor is loaded is trusted.
+                           (IOMMU)inmodernprocessors.                                                                                      After RustMonitor is loaded, the execution continues at the
+                       Memory encryption. To thwart physical memory attacks,                                                           pre-defined entry. RustMonitor sets up its own running con-
+                       such as cold boot and bus snooping attacks, HyperEnclave                                                        text (such as the stack, page table, IDT, etc.) and prepares the
+                       mayleverage hardware memory encryption (such as AMD                                                             virtual CPU (vCPU) configurations for each CPU. Then Rust-
+                       SME[44]andIntelMKTME[42])toencryptpartialphysi-                                                                 Monitor launches the normal VM and demotes the primary
+                       cal memory at the page granularity. If the platform does not                                                    OStothenormalmode.Returningtothekernelmodule,the
+                       support hardware memory encryption, HyperEnclave may                                                            kernel continues to boot in the normal mode and is unaware
+                       consider to apply software approaches [76] to encrypt the                                                       of the existence of RustMonitor.
+                       isolated memory. This approach, however, may impose sub-                                                            HyperEnclave applies the above approach (referred to as
+                       stantial overhead compared with hardware based solutions.                                                       measuredlatelaunch)sothatRustMonitorisloadedasatype-
+                                                                                                                                       2 hypervisor (like KVM) while runs as a type-1 hypervisor
+                       3.3         Trusted Boot, Attestation and Sealing                                                               (like Xen). In this way, RustMonitor does not need to trust
+                                                                                                                                       the primary OS anymore after the primary OS is demoted to
+                       MeasuredLateLaunch.ThebootprocessofHyperEnclave                                                                 the normal mode.
+                       is shown in Figure 3. On system boot, a static and immutable                                                    Remote Attestation. With the measured late launch, all
+                       piece of code, known as the Core Root of Trust for Mea-                                                         booted components are measured and extended to the TPM.
+                       surement (CRTM), executes first to bootstrap the process of                                                     After RustMonitor is booted, it needs to extend the trust to
+                       building a measurement chain for subsequent firmware and                                                        the enclaves. For this purpose, RustMonitor derives an attesta-
+                       software, including the BIOS, grub, the primary OS kernel,                                                      tion key pair which is used to sign the enclave measurement.
+                       and initramfs. The measurements are stored to TPM PCRs                                                          ThenRustMonitor extends the derived public key to the TPM
+                       USENIX Association                                                                                                              2022 USENIX Annual Technical Conference    441
+              PCR,andtheprivate key never leaves RustMonitor which is           official SGX SDK. By replacing the SGX user leaf functions
+              protected by memory isolation and encryption.                     (e.g., EENTER,EEXIT,andERESUME)withhypercalls,SGX
+                During enclave creation, all pages added to the enclave         programs can run on HyperEnclave with little or no source
+              (including the corresponding page content, page type, and         code changes. Once the enclave executes these user leaf func-
+              RWXpermissions)aremeasured by RustMonitor to generate             tions, it traps to RustMonitor and RustMonitor emulates the
+              the enclave measurement. The (intermediate) measurement           functionalities of the corresponding SGX instructions.
+              is stored in RustMonitor’s memory, which is invisible to the        The enclave is compiled as a trusted library of the appli-
+              enclaves and the primary OS.                                      cation, while the application itself runs in the primary OS.
+                Similar to TPM and Intel SGX, HyperEnclave adopts a             Theenclave life cycle is managed through the emulation of
+              SIGn-and-MAc(SIGMA)attestation protocol for the remote            a set of privileged SGX instructions (i.e., ECREATE, EADD,
+              attestation flow. As shown in Figure 4, we denote the pub-        EINIT, etc.). To this end, the kernel module running in the
+              lic key of RustMonitor’s attestation key by the hypervisor        primary OS provides similar functionalities by invoking Rust-
+              attestation public key (hapk). The enclave measurement is         Monitor through hypercalls, and exposes the functionalities
+              signedusingRustMonitor’sattestationkeytoformtheenclave            to the applications by the ioctl() interfaces. By emulating
+              measurement signature (ems). The TPM quote TMP_Quote,             the privileged SGX instructions, RustMonitor is responsible
+              which is signed using the TPM attestation key, includes the       for the management of the enclave’s life cycle (Sec. 4).
+              PCRsforthemeasurementofallbootedcode,andthemea-                     To be compatible with the official Intel SGX SDK,
+              surement of hapk. Upon receiving the attestation report, the      most data structures involved in HyperEnclave (such as the
+              remote user can verify the report by comparing the measure-       SIGSTRUCTstructure, the SECS page, and the TCS page)
+              mentofbootedcode(including the CRTM, BIOS, grub, ker-             are similar to that of SGX. With the HyperEnclave design, it
+              nel, initramfs, and hypervisor) and the enclave, as well as       is straightforward to support dynamic enclave management
+              verifying the certificate chain for generating the signature.     in an enclave, since the enclave memory and page fault are all
+              Secret key generation. When RustMonitor is initialized for        managedbyRustMonitor. Multi-threading within the enclave
+              the first time, it generates a root key K  from the random        is supported by associating one TCS page for each enclave
+                                                     root
+              numbergenerator (RNG) module of the TPM. K          is stored     thread within the enclave. Exception handling within the en-
+                                                              root
+              outside the TPMusingTPM’ssealoperation.Duringtheboot-             clave is supported by setting more than 1 SSA page for each
+              ing process on system reset, RustMonitor decrypts K    using      TCS.Thedetails are omitted due to space constraints and we
+                                                                 root
+              TPM’sunsealoperation, which guarantees that K       can only      refer the readers to the SGX manual [11] for more details.
+                                                              root
+              be unsealed with the exactly same TPM chip with match-
+              ing PCR configurations. Furthermore, RustMonitor floods
+              the PCRs with a constant before transferring control to the       4   Flexible Enclave Operation Mode
+              primary OS to prevent it from retrieving K    . All other key
+                                                        root
+              materials, including the enclave’s sealing key and report key     Awide range of existing applications can be offloaded to
+              are derived from both K     and the enclave’s measurement.
+                                      root                                      the TEEs, such as computing-intensive tasks (machine learn-
+                                                                                ing [60]), input and output (IO)-intensive tasks (such as
+              3.4    TheEnclaveSDK                                              the Apache and Nginx web server [18]), memory-intensive
+                                                                                tasks (Redis and Memcached [18]), and tasks which favor
+              Porting existing applications to the enclaves can be cum-         in-enclave exception handling and privilege separation [21].
+              bersome since TEEs usually expose limited hardware and            MostTEEssupportrunningtheenclaves only in fixed mode,
+              software interfaces and provide additional security services      Intel SGX (also TrustVisor [54] and Secage [51]) enclaves in
+              (e.g., attestation and sealing). For process-based TEEs, the      particular, as part of the application address space, run in user
+              applications need to be partitioned into the trusted and un-      mode. As a result, the user mode enclave is not allowed to ac-
+              trusted parts, and the interfaces need to be carefully designed   cess the privileged resources (such as the IDT and page tables)
+              to avoid various security pitfalls [27,46,69]. A lot of effort    and process the privileged events (interrupt and exceptions).
+              has been spent and many tools have been developed for Intel       It must switch to the untrusted code to gain access to privi-
+              SGX,duetoits dominant position in the market, including           leged resources and handle the events. The I/O-intensive and
+              library OSes [64,67], containers [18], automatic partition and    memory-intensivetasksessentially involve the frequent world
+              protection tools [50,68], WebAssembly Micro Runtime [57],         switches which are expensive and introduce non-negligible
+              and interface protection [65]. Consequently, Intel SGX has        performance losses, even though both software and hardware
+              supported securely running applications written in C/C++,         optimizations have been proposed trying to reduce the context
+              Rust, Java, Python, etc., without expensive code refactoring.     switch latencies [61,66,73]. In this section, we introduce the
+                Weprovide the enclave SDK with APIs compatible with             three enclave operation modes supported by HyperEnclave,
+              the official Intel SGX SDK to ease the development of appli-      as shown in Figure 5. The world switches in different enclave
+              cations on HyperEnclave. The enclave SDK is retrofitting the      operation modes are shown in Figure 6.
+              442    2022 USENIX Annual Technical Conference                                                           USENIX Association
+                          User                                                                                            EENTER                                   EEXIT
+                               App        Enclave            GuestUserApp            PAL
+                          Host                                 .      OS                                            App           GU-Enclave                  App           HU-Enclave
+                                                                                                                                       or 
+                                                             GuestPriv                                               OS            P-Enclave                  OS
+                         .                                     .                                                                 ③     ②                                  ③      ②
+                         Priv                                  Priv                                              ①       ④                                ①       ④
+                                       OS                                TrustVisor
+                         Host   (a) Intel SGX                  Host    (b) TrustVisor                                   RustMonitor                               RustMonitor
+                                                ①                  ②                  ③         Host User
+                                                                                                               ① VM exit (hypercall) ② VM entry          ① VM exit (hypercall) ② syscall return
+                         User  App         GU-Enclave        Encl.   Encl.       HU-Enclave                    ③ VM exit (hypercall) ④ VM entry          ③ syscall           ④ VM entry
+                       Guest
+                         .     OS                             P-Enclave                                       (a) GU-Enclave and P-Enclave                      (b) HU-Enclave
+                       GuestPriv                                                                             Figure 6: World switches for the supported enclave operation
+                         .                                                                                   modes.(a)UsinghypercallstoenterandexitGU-Enclaveand
+                         Priv
+                                                     RustMonitor                                             P-Enclave. (b) Using syscalls and syscall returns to enter and
+                         Host                       (c) HyperEnclave                                         exit HU-Enclave.
+                   Figure 5: Comparison of the enclave operation modes sup-
+                   ported by process-based TEEs. (a) Intel SGX runs enclaves in                              on our platform) (Figure 6). It further eliminates the extra
+                   the host user mode (or guest user mode in the virtualization                             virtualization overhead (e.g. vCPU context switching and
+                   environment). (b) TrustVisor runs the protected code (Pieces                              two-dimensional page walking) in GU-Enclave. HU-Enclave
+                   of Application Logic, PALs) in the guest user mode. (c) Hy-                               maybenefit the I/O-intensive workload according to our eval-
+                   perEnclavesupports3coexistingenclaveoperationmodes:⃝
+                                                                                                  1          uation in Sec 7. By comparison, running enclaves in the guest
+                   GU-Enclaves running in guest user mode; ⃝ P-Enclaves run-
+                                                                            2                                user mode provides more defensive depth.
+                   ning in guest privileged mode and optional guest user mode;                                  When loading the HU-Enclave, RustMonitor prepares a
+                   ⃝HU-Enclavesrunninginhostusermode.
+                    3                                                                                        process context, e.g. creates a level-1 page table. On enclave
+                                                                                                             entry, RustMonitor updates the CPU state and invokes the
+                   4.1      GuestUserEnclaves                                                                system call return instruction (i.e., SYSRET on x86 platforms)
+                                                                                                             to enter the HU-Enclave. Correspondingly, on enclave exit,
+                   Guest user enclave (GU-Enclave) is the basic enclave oper-                                HU-enclaveinvokesthesystemcallinstruction (i.e., SYSCALL
+                   ation mode which is typically running computing-intensive                                 on x86 platforms) and traps into RustMonitor. The ENCLU
+                   tasks. The enclave runs in the guest user mode (i.e., guest                               leaf instructions (e.g., EGETKEY, EREPORT) are emulated
+                   ring-3 of the VMX non-root operation mode).                                               as a system call. Interrupts and exceptions within the HU-
+                      During the enclave creation, RustMonitor prepares a vCPU                               Enclaves also trap into the RustMonitor. The procedures are
+                   structure whichcontainsaguestpagetable(GPT)andanested                                     similar to those for the GU-Enclaves described in Sec. 4.1.
+                   page table (NPT) for GU-Enclave. On entry and exit between                                4.3      Privileged Enclaves
+                   the normal VM and the enclave VM, RustMonitor switches
+                   the vCPU states (e.g. the instruction pointer, thread pointer,                            Inspired by the VM-based TEEs,suchas AMDSEV[45],Hy-
+                   NPT,andGPT)accordingly.                                                                   perEnclave supports privilege enclaves (P-Enclaves) which
+                      Tohandle the interrupts and exceptions during the enclave                              run in guest privileged mode. P-Enclave is permitted to ac-
+                   running, RustMonitor configures the vCPU to trap all inter-                               cess the GDT, IDT, and level-1 page table which benefits a
+                   rupts and exceptions to the monitor mode. RustMonitor then                               wide variety of applications, as demonstrated by Dune [21].
+                   saves the enclave’s context, forwards the interrupt or excep-                             Onesuchexampleisthegarbagecollector, an essential fea-
+                   tion to the normal VM. After the primary OS completes han-                                ture for Java applications (existing works port the JVM to
+                   dling the interrupt or exception, the application invokes the                             enclaves [26,43]). The garbage collector frequently changes
+                   ERESUMEhypercall,whichtrapstoRustMonitortorestore                                         page permissions to trigger page faults in order to track the
+                   the enclave’s context and resume the execution of the enclave.                            page status. For user mode enclaves (e.g., GU-Enclaves and
+                                                                                                             HU-Enclaves), it has to involve the primary OS to update the
+                   4.2      HostUserEnclaves                                                                 page table and handle the page fault which suffers huge per-
+                                                                                                             formance loss due to world switches. P-Enclaves eliminate
+                   Host user enclave (HU-Enclave) is running in host user mode.                              the world switch by supporting in-enclave exception han-
+                   It delivers the optimal world switch efficiency by substitut-                             dling and level-1 page table management. More specifically,
+                   ing the mode switch (hypercalls: ∼ 880 CPU cycles on our                                  P-Enclaves configures its own exception handler to handle
+                   platform) with the ring switch (syscalls: ∼ 120 CPU cycles                                certain exceptions (such as page fault). RustMonitor passes
+                   USENIX Association                                                                                     2022 USENIX Annual Technical Conference    443
+               through the white-list exceptions to the P-Enclave and for-            5.3    TheEnclaveSDK
+               wards others to the primary OS. Furthermore, P-Enclaves can
+               also support page-table-based in-enclave isolation schemes,            HyperEnclave retrofits the official SGX SDK as follows.
+               e.g., sandboxing untrusted third-party libraries.                      Supporting the SGX SDKAPIs.WereplacetheSGXuser
+                  With the ability to receive interrupts within the enclaves, P-      leaf functions (e.g. EENTER, EEXIT, ERESUME, etc.) in the
+               Enclaves may also detect abnormal interrupt events by count-           SGXSDKwithhypercallsorsystemcalls.Ourimplementa-
+               ing the frequency, before requesting RustMonitor to route              tion retains the same parameter semantics and orders as SGX
+               them to the primary OS. As such, existing interrupt-based              for compatibility purposes.
+               side channel attacks [24,37,40,58,59,70] could be detected             Parameters passing with the marshalling buffer. In Hyper-
+               and mitigated. We leave further exploration in this direction          Enclave, the enclave can only access its own address space
+               to future work due to space constraints.                               and the marshalling buffer shared with the application. The
+                                                                                      size of the marshalling buffer can be configured in the en-
+               5    Implementations                                                   clave’s configuration file, with a default size. The data needs
+                                                                                      to be transmitted to the marshalling buffer before invoking
+               Wereport our implementation of HyperEnclave on an AMD                  edge calls. We modified SGX SDK to handle the transitions,
+               platform that supports hardware virtualization technology and          which are thus transparent to the developer.
+               memoryencryption. In the current implementation, RustMon-                We modified the untrusted runtime library in the SDK
+               itor consists of about 7,500 lines of code written mostly in           (i.e., libsgx_urts.so), such that during enclave initializa-
+               Rust, and the kernel module for the primary OS has about               tion a marshalling buffer is allocated using mmap() with
+               3,500 lines of C code. Also, we made about 2,000 lines of              MAP_POPULATE flags set. As a result, the GPAs for the mar-
+               code changes to the official Intel SGX SDK (version 2.13).             shalling buffers are pre-populated. Then an ioctl() is issued
+                                                                                      to request the primary OS not to compact or swap out the
+               5.1    RustMonitor                                                     physical pages of the marshalling buffers during the enclave’s
+                                                                                      lifetime. When the application invokes the emulated EINIT
+               RustMonitor runs at the highest privilege level and enforces           instruction to mark the initialization of the enclave, the base
+               the isolation for the enclaves. To reduce the risks caused by          address and the size of the marshalling buffer are passed to
+               memory corruption or concurrency bugs, we implemented                  RustMonitor, who will add the mapping of the marshalling
+               RustMonitor mostly in Rust, a memory-safe language, with               buffer in the enclave’s page table. In this way, the marshalling
+               only a few lines of assembly code used for context switches.           buffer is now shared between the enclave and the untrusted
+               Comparedwithexisting hypervisors such as KVM [47] and                  application. The base address and the size of the marshalling
+               Xen[29], RustMonitor is much smaller and thus easier to be             buffer are also passed to the trusted runtime library to transmit
+               formally verified. We are working on the formal verification           data from the marshalling buffer to the enclave.
+               of RustMonitor and plan to release the result as a separate              The current OCALL’s implementation in the SGX SDK
+               report.                                                                invokes the sgx_ocalloc() within the enclave to allocate a
+                  Whentheplatform is booted, we configure the kernel com-             buffer on the stack area of the untrusted application, which
+               mandlineparametersinthegrubtoreserveregionsofphysical                  is then used for cross-enclave data transmission. As such, we
+               memory, which are exclusively used by RustMonitor and the              only need to modify the sgx_ocalloc() function to allocate
+               enclaves. RustMonitor manages the reserved physical mem-               a memoryarea in the marshalling buffer. To support parame-
+               ory by maintaining a list of free pages. When an enclave page          ter passing through the marshalling buffer for ECALLs, we
+               is needed, e.g., when adding an enclave page during enclave            modified SGX’s Edger8r tool to automatically generate code
+               creation, a free page is retrieved from the pool; when the             that copies the transmitted data into the marshalling buffer.
+               enclave page is freed, the page is attached to the list again.           TheSGXprogrammingmodelsupportspassingparameters
+               Moreover, RustMonitor also manages the enclave’s page ta-              with the user_check attribute. For such parameters, the SDK
+               bles and processes the page fault.                                     tool will not generate code to check the address range or per-
+                                                                                      form data movement. Since the enclave code could access the
+               5.2    TheKernelModule                                                 entire process’s address space, some enclave programs may
+                                                                                      use a pointer with the user_check attribute to manipulate
+               The kernel module is loaded by the primary OS during the               the data buffer outside the enclave directly, without account-
+               booting process. Then it loads, measures, and launches Rust-           ing for the overhead for copying the data across the enclave
+               Monitor, with the measurement extended to the TPM PCR as               boundary. To deal with it, we added an interface for the de-
+               part of the TPM quote. When the kernel module is loaded, a             veloper to allocate the buffer within the marshalling buffer,
+               device file is created and mounted at /dev/hyper_enclave.              in the cases when the developer may use parameters with the
+               Theapplication can open it and issue the ioctl() to invoke             user_checkattribute.
+               the emulated privileged operations.                                      The remote attestation flow is similar to SGX, following
+               444    2022 USENIX Annual Technical Conference                                                                   USENIX Association
+              the same SIGn-and-MAc (SIGMA) protocol. We extended               malicious enclaves as follows.
+              the sgx_quote_t structure in the SDK to include the Hy-           • Preventing arbitrary memory accesses to the application.
+              perEnclave quote, and the modification is transparent to the        TheSGXenclavecouldaccesstheentireaddress space of
+              enclave code.                                                       the application, and it is possible for attacks such as leaking
+                With the above design, most SGX programs could run on             the secret keys or stack canaries, or tampering with the code
+              HyperEnclave without source code changes. Furthermore, to           pointers for control flow attacks. In HyperEnclave, the en-
+              ease the development of HyperEnclave applications, we have          clave can only access its own memory and the marshalling
+              also ported the Rust SGX SDK [71] and the Occlum library            buffer, which is only used for parameter passing.
+              OS[64]toHyperEnclave.                                             • Preventing arbitrary control flows after EEXIT. The SGX
+                                                                                  design allows the enclave to jump to arbitrary addresses
+              6   Security Analysis                                               bysetting rbx before executing the EEXIT instruction (i.e.,
+                                                                                  exiting the enclave), opening door to enclave malware at-
+              Trust Establishment. HyperEnclave relies on measured boot           tacks [63]. In our design, since the EEXIT instruction is
+              to bootstrap the trust of RustMonitor, a common approach for        emulated by RustMonitor, it is easy to prevent such attacks
+              the design of TEEs (e.g., TrustZone [16] and Keystone [49]).        byadding the validity check when EEXIT is invoked.
+              All the components during booting (including the CRTM,            Physical attacks. Hardware memory encryption techniques
+              BIOS,grub,kernel,andinitramfs) are measuredandextended            such as AMD SMEcouldbeusedtoprotect the enclave from
+              to the TPM PCRs. As a result, any tampering of the booted         physical attacks such as cold boot attacks or bus snooping
+              code will be reflected and audited through remote attestation.    attacks. With memory encryption, data are always encrypted
+                WeconsiderHyperEnclaveisdeployedinacontrolledenvi-              in the memory or on the memory bus, and are only decrypted
+              ronment(i.e., the data center in the cloud computing scenario)    within the CPU. The memory encryption key is generated
+              such that the attacker has limited physical access to the plat-   randomlyonsystembootandstoredintheCPU,whichcannot
+              forms. To reduce the attack surface and minimize the TCB,         be accessed explicitly by software.
+              weputthe RustMonitor image into the initramfs, and Rust-          Side channel attacks. Compared with SGX, HyperEnclave
+              Monitor is loaded and measured in early userspace. In this        can mitigate certain types of side channel attacks. Since the
+              phase, the primary OS kernel does not accept external inputs      enclave’s guest page tables and page fault events are pro-
+              fromtheuser,andtheperipherals such as network connection          cessed by RustMonitor without primary OS involvement, the
+              are disabled. With the measured late launch approach, Rust-       latter cannot mount page-table-based attacks [25,72,74]. We
+              Monitor does not need to trust the primary OS anymore after       leave the protection against micro-architectural attacks such
+              the OS is demoted to the normal mode.                             as speculative execution attacks as future work.
+              Enclave memory isolation. As presented in Sec. 3.2, the
+              enclave’s memory and page tables are maintained by Rust-
+              Monitor, which are inaccessible to the primary OS. The TLBs       7   Evaluation
+              are cleared upon world switches to prevent illegal memory
+              accesses using stale TLB entries. RustMonitor prevents the        WedeployedHyperEnclaveonaserverwithtwoAMDEPYC
+              primaryOStoaccessthereservedphysicalmemorybyremov-                7601CPUs(2threadspercore,totalof128logicalcores)with
+              ing the corresponding mappings from its NPT. RustMonitor          512GBDDR4RAM.Weconfigure2GBreservedmemory
+              also configures the IOMMU to prevent unauthorized device          for RustMonitor, and 24 GB for EPC memory. The primary
+              accesses to the reserved physical memory.                         OSisUbuntu18.04LTSwithLinuxkernel4.19.91. For com-
+                Ourdesign prevents the memory mapping attacks since the         parison, we run the same experiments on an Intel Xeon E3-
+              primary OS cannot interfere with the enclave’s address map-       1270v6CPUwithSGXenabled,with64GBDDR4RAM,
+              pings. Weintroducethemarshallingbuffertosupportmemory             running the same OS. The SGX SDK version for both Hyper-
+              sharing between the enclave and the application. The applica-     Enclave and the native SGX hardware are 2.13. All programs
+              tion pre-allocates a marshalling buffer in normal memory and      are compiled with GCC 7.5.0 and the same optimization level.
+              passes the base address and size of the buffer to RustMonitor       We tried to rule out differences between hardware. Ex-
+              during enclave initialization. In case the application may pass   cept where explicitly stated, the evaluations didn’t exceed
+              crafted addresses (e.g., to overwrite the enclave memory),        the EPC size, so as not to trigger excessive page swapping.
+              before adding the mapping of the marshalling buffer to the        All evaluations were performed in single-threaded mode. For
+              enclave’s page table, RustMonitor ensures the address range       micro-benchmarks (Table 1 and Table 2), we compare Hyper-
+              of the marshalling buffer is outside the enclave address range.   EnclaveonAMDhardwarewithSGXonIntelhardwareusing
+              Defense Against Compromised Enclaves. Previous work               the sameSGXSDK.Wemeasuredthecorecyclestoavoidthe
+              demonstrates that enclave malware may steal secret data or        influence of CPU frequencies. For real-world workloads, we
+              hijack the control-flow of the application outside the en-        set the baselines as the counterparts with no security protec-
+              clave [63]. HyperEnclave is designed to confine potentially       tions on Intel and AMD platforms respectively, and compare
+              USENIX Association                                                          2022 USENIX Annual Technical Conference    445
+                                 EENTER      EEXIT    ECALL     OCALL                       in               out               in&out
+                                                                                            in (ms_buf)      out (ms_buf)      in&out (ms_buf)
+                    Intel SGX            -        -    14,432     12,432                35                         35
+                                                                                        30                         30
+                                                                                              HyperEnclave               HyperEnclave
+                  HU-Enclave        1,163    1,144      8,440      4,120                25                         25
+                  GU-Enclave        1,704    1,319      9,480      4,920                20                         20
+                                                                                        15                         15
+                    P-Enclave       1,649    1,401      9,700      5,260               (x1000)
+                                                                                        10                         10
+                                                                                         5                          5
+                                                                                              5     15                   5     15
+              Table 1: Latency of SGX primitives on HyperEnclave and                       0     10     20 25 30      0     10     20 25 30
+                                                                                       cycles
+                                                                                        35                         35
+                                                                                        30                         30
+              Intel (in CPU cycles).                                                   of
+                                                                                              Intel SGX                  Intel SGX
+                                                                                        25                         25
+                                                                                        20                         20
+                              Intel SGX    GU-Enclave    P-Enclave
+                                                                                        15                         15
+                                                                                       Median
+                        #UD      28,561         17,490         258                      10                         10
+                                                                                         5                          5
+                                                                                              5     15                   5     15
+                        #PF            –         2,660        1,132                        0     10     20 25 30      0     10     20 25 30
+                                                                                                (a) ECALLs                 (b) OCALLs
+              Table 2: Average CPU cycles of handling an #UD and #PF               Figure 7: Marshalling buffer overhead for ECALLs and
+              exception inside the enclaves.                                       OCALLs with various data size, and with the marshalling
+              the relative slowdowns introduced by SGX and HyperEn-                buffer (marked as ms_buf) enabled and disabled.
+              clave. Since we only compare the relative slowdowns, we              executes an undefined instruction in the enclave to trigger the
+              stress that the absolute performance results are on dissimilar       exception 1,000,000 times. The exception handler advances
+              platforms and are not directly comparable. All HyperEnclave          the instruction pointer and returns. For P-Enclave, the excep-
+              evaluations were measured with memory encryption enabled.            tions are captured and handled entirely within the enclaves,
+                 We’vebeencareful in ensuring HyperEnclave implements             without enclave mode switches. For GU-Enclave and SGX,
+              the TEE functionality correctly. Still, memory encryption be-        an exception causes an asynchronous enclave exit (AEX)
+              tween SGX1andHyperEnclaveisdifferent, i.e., Merkel tree              and switches the CPU to the untrusted OS, then executes a
+              and AES-CTRversusAES-XTS(seeFigure11inSec.A.3                        two-phase exception handling [7]. The result shows that the
+              for the evaluation of memory encryption overhead), which             exception handling within P-Enclaves is about 68× and 110×
+              may explain the improvement for memory-intensive work-               faster than GU-Enclave and Intel SGX respectively (Table 2).
+              loads. Besides, world switches for HyperEnclave (especially,           Wefurther simulated a typical garbage collector (GC) sce-
+              HU-enclave) are faster, which explains the improvement for           nario that the test code first allocated a large memory buffer,
+              I/O-intensive workloads.                                             then the write permissions to the buffer were revoked by
+              7.1    WorldSwitchesPerformance                                      changing the enclave’s page table. After that, the enclave ac-
+                                                                                   cessed the buffer to trigger the page faults. In the exception
+              We measured the latency of edge calls (i.e., ECALLs and              handler, the write permission is restored. The result (Table 2)
+              OCALLs)onbothHyperEnclave(underdifferent enclave op-                 shows that P-Enclave is about 2.3× faster than GU-Enclave,
+              eration modes) and Intel SGX. The test code runs empty edge          for P-Enclave updates the page table and handles the page
+              calls with no explicit parameters 1,000,000 times and takes          faults by itself, while GU-Enclave needs to trap into RustMon-
+              the median value. We also measured the instruction-level la-         itor to update the page tables. Note that we did not evaluate
+              tency for the emulated EENTER and EEXIT instructions on              GConIntelSGX,sinceourSGX1platformdoesnotsupport
+              HyperEnclave. We were not able to measure the instruction-           page permission modifications after the enclave initialization.
+              level latency on SGX since the RDTSCP instruction is not
+              supported within the enclaves on our SGX platform.                   7.3    Marshalling Buffer Overhead
+                 Theresults are shown in Table 1. It shows that HU-Enclave
+              has the optimal edge calls performance as it reduces a mode         Tomeasuretheoverheadofintroducingthemarshallingbuffer,
+              switch (∼880 cycles) to a ring switch (∼ 120 cycles) while          weconstructed a GU-Enclave variant that does not use the
+              P-Enclave is slower than GU-Enclave for it needs to switch           marshalling buffer as the baseline. We measured the over-
+              moreprivileged states during the world switches. All of the          headforbothECALLsandOCALLswithvarioussizesofthe
+              results are comparable with Intel SGX.                               transferred data while varying the directions for data move-
+                                                                                   ment(i.e., “in”, “out” and “in&out”). We ensure the data to
+              7.2    Enclave Exception Handling                                    be transferred is not cached using the CLFLUSH instruction.
+                                                                                  Weevaluated the performance for transferring the same data
+              Weused the undefined instruction exception (#UD) and the             onSGXforcomparison.
+              page fault exception (#PF) to evaluate the enclave exception           Figure 7 provides the results for ECALLs and OCALLs
+              handling performance. In the #UD benchmark, the test code            respectively. It shows that the overhead increases almost lin-
+              446    2022 USENIX Annual Technical Conference                                                               USENIX Association
+                                                                                                        Baseline         GU-Enclave           Memoryusage                                   Baseline         GU-Enclave                                        Baseline          GU-Enclave
+                                              Baseline          HyperEnclave           SGX
+                                                                                                        SGX              HU-Enclave                                                         SGX              HU-Enclave                                        SGX               HU-Enclave
+                                                               AMD
+                                    1.2
+                                                                                                                                                                          8K
+                                                                                                     60                                                  300
+                                                                             1.00
+                                           1.00
+                                                1.00
+                                                               1.00
+                                                                                       1.00
+                                                                        0.99
+                                                     0.99
+                                                                                                                                                                                                                                            2.5
+                                                          0.99
+                                                                                  0.97
+                                                                   0.95
+                                                                                                                                                                                                      AMD
+                                    1.0
+                                                                                                                                AMD
+                                                                                                                                                                                                                                                                          AMD
+                                                                                                                                                                               0.82
+                                                                                                                                                                          7K
+                                                                                                     50
+                                                                                                                                                                                   0.83
+                                    0.8
+                                                                                                                                                                                                                                            2.0
+                                                                                                                                                                          6K
+                                    0.6                                                              40     0.980.970.970.960.960.960.960.960.950.95 200Memory            5K 0.69       0.81 0.830.84 0.85                                  1.5
+                                    0.4
+                                                                                                                                                                                   0.71
+                                                                                                                                                                                                          0.88
+                                                                                                     30
+                                                                                                                                                                                                               0.83
+                                                                                                                                                                          4K
+                                                                                                                                                                                                                    0.83
+                                                                                                                                                                                        0.71
+                                    0.2
+                                                                                                                                                                                                                         0.86
+                                                                                                                                                                                                                                            1.0
+                                                                                                                                                                                                                             0.84
+                                                                                                                                                                                            0.73
+                                                                                                     20                                                  100
+                                                                                                                                                                          3K
+                                    0.0
+                                                                                                                                                                                                 0.74
+                                                                                                                                                                                                      0.75
+                                malized)
+                                                 T
+                                             T
+                                                                                                   op/s)                                                                                                                                    0.5
+                                                                                                                                                                       eq/s)                               0.78
+                                                                                                     10
+                                         SOR SOR        TION           IDEA      NET                                                                          Usage       2K                                    0.74 0.74
+                                                       A
+                                                                                                                                                                       (r                                                0.76
+                                                                               AL
+                                                                                                   (k                                                                                                                         0.75
+                                                          FOURIER
+                                                BITFIELD
+                                                   EMUL                 HUFFMAN                        0                                                 0                                                                                (ms)
+                                                                           NEUR
+                                                            ASSIGNMENT
+                                (nor
+                                        STRING
+                                                 FP
+                                  NUMERIC
+                                                                                                                                                                                1                                                                 5       7.5                     15     17.5
+                                                                                                                                                                                   10 20 30 40 50 60 70 80 90 100                                                 10     12.5                      20
+                                                                                                         0 20 40 60 80 100120140160180200
+                                                                            DECOMPOSITION
+                                                                          U
+                                                                          L
+                                    1.2                        Intel    0.99 0.98 1.03 0.99          90                         Intel                    300(MB)        14K                           Intel                                 1.2                           Intel
+                                                                                                                                                                        12K
+                                                               0.98
+                                                     0.97
+                                                          0.97
+                                                0.96
+                                                                   0.95
+                                                                                                     75                                                                oughput
+                                           0.91                                                    oughput
+                                    1.0
+                                                                                                                                                                                                                                            1.0
+                                    0.8                                                            Thr60                                                 200           Thr10K 0.51                                                        Latency0.8
+                                                                                                                                                                          8K
+                                    0.6
+                                                                                                                                                                                   0.58
+                                                                                                            0.75
+                                                                                                     45
+                                                                                                                0.75
+                                                                                                                     0.75
+                                                                                                                                                                                        0.58
+                                    0.4
+                                                                                                                                                                                                                                            0.6
+                                                                                                                         0.66
+                                                                                                                                                                          6K
+                                                                                                                                                                                            0.62
+                                                                                                                              0.61
+                                Iterations/sec
+                                                                                                                                                                                                 0.60
+                                                                                                                                  0.57
+                                                                                                     30                                                  100
+                                                                                                                                               0.55
+                                                                                                                                      0.54
+                                                                                                                                                                                                      0.62
+                                                                                                                                           0.53
+                                    0.2
+                                                                                                                                                    0.50
+                                                                                                                                                                                                           0.61
+                                                                                                                                                                                                                0.63
+                                                                                                                                                                          4K
+                                                                                                                                                                                                                    0.63
+                                                                                                                                                                                                                         0.62
+                                                                                                                                                                                                                                            0.4
+                                                                                                                                                                                                                              0.63
+                                    0.0
+                                                                                                     15
+                                                                                                                                                                          2K
+                                                 T
+                                             T
+                                                                                 NET
+                                                                                                                                                                                                                                            0.2
+                                                                       IDEA
+                                                        TION
+                                              SOR
+                                         SOR
+                                                       A
+                                                                                                       0                                                 0
+                                                                               AL
+                                                          FOURIER
+                                                BITFIELD
+                                                                        HUFFMAN
+                                                                                                                                                                                1                                                                 5               15
+                                                                                                                                                                                   10 20 30 40 50 60 70 80 90 100                                         10              20      25      30       35
+                                                                                                         0 20 40 60 80 100120140160180200
+                                                   EMUL
+                                                                           NEUR
+                                                            ASSIGNMENT
+                                        STRING
+                                                 FP
+                                  NUMERIC
+                                                                            DECOMPOSITION
+                                                                                                                                                                                   Requested web page size (KB)                                               Throughput (kop/s)
+                                                                          U
+                                                                                                                  Numberofrecords (x1000)
+                                                                          L
+                                                  (a) NBench                                                          (b) SQLite                                             (c) Lighttpd on Occlum                                                (d) Redis on Occlum
+                                       Figure 8: Performance of NBench, SQLite, Lighttpd, and Redis on AMD (with HyperEnclave) and Intel (with SGX).
+                             early with the data size. For ECALLs, the overhead for “in”,                                                                                GU-Enclave and HU-Enclave have almost the same perfor-
+                            “out” and “in&out” directions is 8%, 11% and 21% respec-                                                                                     manceasthebaseline (< 5% overhead). We speculate that it’s
+                             tively for transferring 16 KB data, due to the extra memory                                                                                 because the memory encryption performance for AMD SME
+                             copy. For OCALLs, the overhead is negligible, since it allo-                                                                                (without integrity protection) is faster than SGX.
+                             cates a buffer on the marshalling buffer without additional                                                                                 Lighttpd. WeranaLighttpd(v1.4.40)serverwithOcclumon
+                             memory copy (Sec. 5.3). We remind that data transfers in                                                                                    both SGXandHyperEnclave(GU-EnclaveandHU-Enclave
+                             ECALLs contribute a small portion to the processing time                                                                                    modes). We used the Apache HTTP benchmarking tool [10]
+                             for many real-world computation workloads, especially for                                                                                   andran100concurrentclientsoverthelocalloopbacktofetch
+                             computation or memory intensive tasks.                                                                                                      various sizes of web pages to evaluate the throughput. In this
+                                                                                                                                                                         evaluation, the overhead mainly comes from the frequent
+                             7.4           Real-world Workloads                                                                                                          enclave mode switches (Table 1). As shown in Figure 8c,
+                                                                                                                                                                         HU-Enclave delivers the best performance as expected (81%
+                             The evaluations were conducted on four real-world appli-                                                                                    ∼88%ofthebaseline).GU-Enclaveachieves69%∼78%of
+                             cations: an algorithm benchmark suite NBench [53], a                                                                                        the baseline, while SGX achieves 51% ∼ 63% of the baseline.
+                             lightweight web server Lighttpd [13], two popular databases                                                                                 Redis. We use Redis to evaluate the performance under
+                             SQLite[14]andRedis[15],asrepresentationsforCPUinten-                                                                                        the comprehensive scenarios where both memory and I/O
+                             sive, I/O-intensive, and memory-intensive tasks. We ported                                                                                  are intensive. We ran a Redis (v6.0.9) database server with
+                             the library OS Occlum [64] (v0.21) to the enclave SDK to                                                                                    OcclumonbothSGXandHyperEnclave(GU-Enclaveand
+                             reducetheportingeffortforLighttpdandRedis.Wemeasured                                                                                        HU-Enclave modes). Similar to SQLite, we configured the
+                             the performance on both HyperEnclave and Intel SGX, using                                                                                   database as in-memory and used the YCSB workload A. For
+                             the same code compiled under the SDK simulation mode as                                                                                     the evaluation, we first loaded 50,000 records (in total 50
+                             the baseline (providing no security guarantees).                                                                                            MBdata) and then performed 100,000 operations from 20
+                             NBench. NBench measures the performance of a system’s                                                                                       clients over the local loopback. We increased the request fre-
+                             CPU,FPU,andmemorysystem,withoutI/Oandsystemcalls                                                                                            quency and measured the latency under different throughput.
+                             involved. We used an adaptation of NBench to SGX, i.e.,                                                                                     As shown in Figure 8d, HU-Enclave achieves 89% of the
+                             SGX-NBench[8]withnosourcecodemodification for our                                                                                           maximumthroughputofthebaseline, while GU-Enclave and
+                             evaluation. As shown in Figure 8a, the overhead introduced                                                                                  SGXareabout72%and48%ofthebaseline,respectively.
+                             by HyperEnclave and SGX is about 1% and 3% respectively.
+                             SQLite. We ported SQLite (v3.19.3) with the enclave SDK,                                                                                    8         Discussions
+                             and evaluated it on both Intel SGX and HyperEnclave (GU-
+                             Enclave and HU-Enclave) using the YCSB [30] workload                                                                                        HyperEnclaveonotherplatforms.HyperEnclave requires
+                             A(50%reads,50%updates).Inthis evaluation we focused                                                                                         the virtualization extension (specifically, two-level address
+                             onthe memoryperformance, so we configured the database                                                                                      translation) for isolation and TPM for the root of trust and
+                             as in-memory and embedded the client into the enclave to                                                                                    randomness, etc. Virtualization is supported on many ARM
+                             avoid I/O operations. We increased the number of records                                                                                    servers (such as the ARMv8 platforms [2]). The RISC-V H-
+                             and measured the time for 100,000 database operations. As                                                                                   extension specification has evolved to v0.6.1 in 2021. Both
+                             shown in Figure 8b, on SGX the throughput is about 75%                                                                                      ARMandRISC-Vvirtualization support two-level address
+                             of the baseline for small memory usage. When the memory                                                                                     translation. Certain TPM products already support ARM
+                             usage exceeds the EPC size (about 90 MB), the performance                                                                                   servers. Research has been conducted to support firmware
+                             drops to 50% due to page swapping. On HyperEnclave, both                                                                                    TPM on RISC-V [22]. As such, signs are promising that
+                             USENIX Association                                                                                                                                               2022 USENIX Annual Technical Conference    447
+               HyperEnclave can be adapted to run on ARM and RISC-V                 large code base in the TCB, including device drivers, guest IO
+               platforms.                                                           emulation, network and block device virtualization, etc. For
+                 However, porting HyperEnclave to ARM and RISC-V plat-              example, AWS Nitro Enclaves [3] are constructed by the host
+               forms requires non-trivial engineering effort, considering that      KVMandLinux,andthus the host Linux kernel is always
+               the instruction set architectures (ISAs) are totally different.      trusted. We made the design choice to minimize the TCB of
+               Take the ARMv8 architecture as an example. The software              RustMonitor, which performs basic CPU/memory virtualiza-
+               modules can be mapped to different exception levels (ELs):           tion and enclave management. The primary OS kernel only
+               ThemonitormodeforRustMonitorcanbemappedtoEL2;                        needs to be trusted during the boot process and is demoted
+               The normal mode for the primary OS and untrusted part of             after RustMonitor starts.
+               the applications can be mapped to EL1 and EL0 respectively;             Komodo[35]implementsanSGX-likeenclaveprotection
+               Thesecure mode for enclaves can be mapped flexibly to EL1            model in the TrustZone environment. Keystone [49] supports
+               or EL0. Memoryisolation can be supported similarly with the          customizable TEEs on RISC-V platforms. Komodo enclaves
+               support of stage 2 address translations. Furthermore, the offi-      run in secure user mode, while Keystone enclaves run in U-
+               cial Intel SGX SDKonlysupportsx86platforms.Inparticular,             mode and S-mode. In comparison, HyperEnclave supports
+               the transitions across enclave boundaries are handled with           flexible enclave mode (guest ring-3, guest ring-0/ring-3, and
+               platform-dependent assembly code, and need to be rewritten           host ring-3). Both Komodo and HyperEnclave use page-table-
+               according to the application binary interface (ABI) of the tar-      based memory isolation, while Keystone uses PMP (physical
+               geted platforms. We leave the further exploration of adapting        memoryprotection) for memory isolation.
+               HyperEnclave to other platforms as future work.                         Recently, ARM introduced the Realm Management Exten-
+               Attack surfaces under different enclave operation modes.             sion (RME) in the forthcoming ARMv9-A architecture [1].
+               Theuntrusted primary OS still runs within the VM and the at-         Themonitor (running at EL3) enforces physical memory iso-
+               tack surface from the primary OS to enclaves does not change.        lation among the secure, non-secure, and Realm worlds. The
+               Running the enclaves in privileged mode or in the host, how-         trusted Realm Management Monitor (RMM), which executes
+               ever, may expose more attack surfaces to a malicious enclave.        at EL2 in Realm security state (R-EL2), isolates the Realms
+               For example, it may make the enclave malware easier to esca-         from each other through the stage 2 page tables. Similar to
+               late to host ring-0, if the enclave runs in the host already.        HyperEnclave, the RMM is much simpler than a typical hy-
+                                                                                    pervisor and relies on the non-secure hypervisor for device
+               9   Related Works                                                    emulation etc. RME requires architectural extensions, while
+                                                                                    HyperEnclave does not. Moreover, HyperEnclave decouples
+               Most existing TEEs require specific hardware or firmware             its trust chain from the CPU as much as possible to construct
+               changes [17,33,39,39,41,45,55]. Specifically, CURE [20]              an open and cross-platform TEE.
+               changes the CPU core to support the enclave identifier (eid),
+               and modifies the system bus to support the memory and pe-            10 Conclusion
+               ripheral arbiters for memory and peripheral access control ac-
+               cording to the eid. Then the trusted security monitor can con-       In this paper, we proposed HyperEnclave, an open TEE that
+               figure the hardware primitives to support the flexible enclaves.     can run on various platforms with minimum hardware re-
+               In contrast, HyperEnclave supports flexible enclave modes on         quirements. It supports the process-based TEE model, and
+               commodityhardwareswithouthardwareorfirmwarechanges.                  SGX programs can run on HyperEnclave with little or no
+                 A line of research has been conducted to build the iso-            code changes. Moreover, HyperEnclave supports the flexible
+               lated execution environment (e.g., PAL for TrustVisor and            enclave operation modes to fulfill various enclave workloads.
+               HAPforInkTag) using virtualization extensions, including             WeimplementedHyperEnclaveoncommodityAMDservers
+               TrustVisor [54], InkTag [38], Overshadow [28], AWS Nitro             and deployed the system internally for real-world compu-
+               Enclaves [3], Microsoft Defender Credential Guard [5] and            tations. We are working on the formal verification of the
+               Hyper-VShielded VMs [6]. TrustVisor makes the PAL page               implementation and plan to open source to the community.
+               table pages read-only to prevent memory mapping attacks.
+               The design introduces much overhead during PAL registra-
+               tion and switches from/to PALs. Even worse, it triggers many         Acknowledgments
+               NPTviolations in high memory pressures scenarios, due to
+               the updates to the access and dirty bits of the PAL page tables,     We would like to thank our shepherd David Cock and the
+               introducing huge overhead [52]. In Inktag, the HAP page ta-          anonymousreviewersfortheirinvaluablefeedback.Thiswork
+               bles are managedbythehypervisor.ItallowstheuntrustedOS               was supported in part by the National Key R&D Program
+               to request the hypervisor to update the HAP page tables. Both        of China (Grant No. 2020YFB1805402) and the National
+               TrustVisor and InkTag are susceptible to page-table-based            Natural Science Foundation of China (Grant No. 61802397
+               attacks [72,74]. Furthermore, these designs usually contain a        and No. U19A2060).
+               448    2022 USENIX Annual Technical Conference                                                                 USENIX Association
+             References                                                   [17] ARM.         Arm Confidential Compute       Archi-
+                                                                               tecture.         https://www.arm.com/why-arm/
+              [1] Arm Realm Management Extension (RME) Sys-                    architecture/security-features/
+                  tem Architecture.   https://developer.arm.com/               arm-confidential-compute-architecture,
+                  documentation/den0129/latest.                                2020.
+              [2] Armv8 white paper. https://community.arm.com/           [18] Sergei Arnautov, Bohdan Trach, Franz Gregor, Thomas
+                  docs/DOC-10896.                                              Knauth, Andre Martin, Christian Priebe, Joshua Lind,
+                                                                               Divya Muthukumaran, Dan O’keeffe, Mark L Stillwell,
+              [3] AWS Nitro Enclaves User Guide.              https:           et al. SCONE: Secure linux containers with intel SGX.
+                  //docs.aws.amazon.com/enclaves/latest/                       In 12th USENIX Symposium on Operating Systems De-
+                  user/nitro-enclave.html.                                     sign and Implementation (OSDI 16), pages 689–703,
+                                                                               2016.
+              [4] ISO/IEC, P.D.: 11889: Information technology – Secu-
+                  rity techniques – Trusted platform module.              [19] AhmedM.Azab,P.Ning,Jitesh Shah, Quan Chen, Ro-
+                                                                               han Bhutkar, G. Ganesh, Jia Ma, and Wenbo Shen. Hy-
+              [5] Manage    Windows     Defender Credential   Guard.           pervision across worlds: Real-time kernel protection
+                  https://docs.microsoft.com/en-us/                            from the arm trustzone secure world. Proceedings of
+                  windows/security/identity-protection/                        the 2014 ACM SIGSAC Conference on Computer and
+                  credential-guard/credential-guard-manage.                    Communications Security, 2014.
+              [6] Microsoft  Hyper-V    Shielded  VM.         https:      [20] Raad Bahmani, Ferdinand Brasser, Ghada Dessouky,
+                  //www.techtarget.com/searchwindowsserver/                    Patrick Jauernig, Matthias Klimmek, Ahmad-Reza
+                  definition/Microsoft-Hyper-V-Shielded-VM.                    Sadeghi, and Emmanuel Stapf. CURE: A security ar-
+                                                                               chitecture with customizable and resilient enclaves. In
+              [7] SGXtwophaseexception handling. https://github.               30th USENIX Security Symposium (USENIX Security
+                  com/MWShan/linux-sgx/blob/master/docs/                       21). USENIXAssociation, August 2021.
+                  DesignDocs/IntelSGXExceptionHandling-Linux.
+                  md.                                                     [21] Adam Belay, Andrea Bittau, Ali Mashtizadeh, David
+                                                                               Terei, David Mazières, and Christos Kozyrakis. Dune:
+              [8] The nbench benchmark ported to SGX.      https://            Safe user-level access to privileged CPU features. In
+                  github.com/utds3lab/sgx-nbench,2017.                         10th USENIX Symposium on Operating Systems Design
+                                                                               andImplementation (OSDI 12), pages 335–348, Holly-
+              [9] Google. Asylo. https://asylo.dev/, 2019.                     wood, CA, October 2012. USENIX Association.
+             [10] ab - apache http server benchmarking tool. https://     [22] Marouene Boubakri, Fausto Chiatante, and Belhassen
+                  httpd.apache.org/docs/2.4/programs/ab.html,                  Zouari. Towards a firmware TPM on RISC-V. In 2021
+                  2021.                                                        Design, Automation & Test in Europe Conference &
+                                                                               Exhibition (DATE), pages 647–650. IEEE, 2021.
+             [11] Intel 64 and IA-32 architectures software developer’s
+                  manual, combined volumes:1,2A,2B,2C,3A,3B,3C            [23] F. Brasser, D. Gens, P. Jauernig, A. R. Sadeghi, and
+                  and 3D. https://software.intel.com/content/                  E. Stapf. Sanctuary: Arming trustzone with user-space
+                  dam/develop/external/us/en/documents-tps/                    enclaves. In Network and Distributed System Security
+                  325462-sdm-vol-1-2abcd-3abcd.pdf,2021. Order                 Symposium, 2019.
+                  Number:325462-075US,June2021.                           [24] Ferdinand Brasser, Urs Müller, Alexandra Dmitrienko,
+             [12] Intel SGX for Linux. https://github.com/intel/               Kari Kostiainen, Srdjan Capkun, and Ahmad-Reza
+                  linux-sgx, 2021.                                             Sadeghi. Software grand exposure:sgx cache attacks
+                                                                               are practical. In 11th USENIX Workshop on Offensive
+             [13] Lighttpd. https://www.lighttpd.net, 2021.                    Technologies (WOOT 17), 2017.
+             [14] SQLite. https://www.sqlite.org, 2021.                   [25] Jo Van Bulck, Nico Weichbrodt, Rüdiger Kapitza, Frank
+                                                                               Piessens, and Raoul Strackx. Telling your secrets with-
+             [15] Redis. https://redis.io, 2022.                               out page faults: Stealthy page table-based attacks on en-
+                                                                               claved execution. In 26th USENIX Security Symposium
+             [16] T. Alves and D. Felton. Trustzone: Integrated hardware       (USENIX Security 17), pages 1041–1056, Vancouver,
+                  and software security. white paper, 2004.                    BC,August2017.USENIXAssociation.
+             USENIX Association                                                    2022 USENIX Annual Technical Conference    449
+             [26] Chia che Tsai, Jeongseok Son, Bhushan Jain, John           [38] Owen S. Hofmann, Sangman Kim, Alan M. Dunn,
+                   McAvey,RalucaA.Popa,andDonaldE.Porter. Civet:                  Michael Z. Lee, and Emmett Witchel. Inktag: secure ap-
+                   Anefficient java partitioning framework for hardware           plications on an untrusted operating system. ASPLOS ...
+                   enclaves. In USENIX Security Symposium, 2020.                  proceedings. International Conference on Architectural
+             [27] Stephen Checkoway and Hovav Shacham. Iago attacks:              Support for Programming Languages and Operating
+                   Why the system call api is a bad untrusted rpc inter-          Systems, pages 253–264, 2013.
+                   face. ACM SIGARCH Computer Architecture News,             [39] Guerney DH Hunt, Ramachandra Pai, Michael V Le,
+                   41(1):253–264, 2013.                                           Hani Jamjoom, Sukadev Bhattiprolu, Rick Boivie, Lau-
+             [28] Xiaoxin Chen, Tal Garfinkel, E Christopher Lewis,               rent Dufour, Brad Frey, Mohit Kapur, Kenneth A Gold-
+                   PratapSubrahmanyam,CarlAWaldspurger,DanBoneh,                  man, et al. Confidential computing for openpower. In
+                   Jeffrey Dwoskin, and Dan RK Ports. Overshadow: a               Proceedings of the Sixteenth European Conference on
+                   virtualization-based approach to retrofitting protection       ComputerSystems, pages 294–310, 2021.
+                   in commodity operating systems. ACM SIGOPS Oper-          [40] Tianlin Huo, Xiaoni Meng, Wenhao Wang, Chunliang
+                   ating Systems Review, 42(2):2–13, 2008.                        Hao,PeiZhao,JianZhai,andMingshuLi. Bluethunder:
+             [29] David Chisnall. The definitive guide to the xen hypervi-        A2-leveldirectional predictor based side-channel attack
+                   sor. Pearson Education, 2008.                                  against sgx. IACR Transactions on Cryptographic Hard-
+                                                                                  ware and Embedded Systems, pages 321–347, 2020.
+             [30] Brian F. Cooper, Adam Silberstein, Erwin Tam, Raghu
+                   Ramakrishnan, and Russell Sears. Benchmarking cloud       [41] Intel.   Intel Trust Domain Extensions.       https:
+                   serving systems with ycsb. In Proceedings of the 1st           //software.intel.com/content/dam/develop/
+                   ACMSymposiumonCloudComputing,SoCC’10,page                      external/us/en/documents/tdxwhitepaper-v4.
+                  143–154, New York, NY, USA, 2010. Association for               pdf, 2020.
+                   ComputingMachinery.                                       [42] Intel.       Intel Architecture   Memory Encryp-
+             [31] Standard Performance Evaluation Corporation. SPEC               tion   Technologies    Specification.         https:
+                   CPU 2017.       https://www.spec.org/cpu2017/,                 //software.intel.com/content/dam/
+                   2021.                                                          develop/external/us/en/documents-tps/
+             [32] VictorCostanandS.Devadas. Intelsgxexplained. IACR               multi-key-total-memory-encryption-spec.pdf,
+                   Cryptol. ePrint Arch., 2016:86, 2016.                          2021.
+             [33] VictorCostan,IliaLebedev,andSrinivasDevadas. Sanc-         [43] Jianyu Jiang, Xusheng Chen, Tsz On Li, Cheng Wang,
+                   tum: Minimal hardware extensions for strong soft-              Tianxiang Shen, Shixiong Zhao, Heming Cui, Cho-Li
+                   ware isolation. In 25th USENIX Security Symposium              Wang, and Fengwei Zhang. Uranus: Simple, efficient
+                  (USENIXSecurity 16), pages 857–874, Austin, TX, Au-             sgx programming and its applications. Proceedings
+                   gust 2016. USENIX Association.                                 of the 15th ACM Asia Conference on Computer and
+                                                                                  Communications Security, 2020.
+             [34] McKeenF., Alexandrovich I., Anati I., Caspi D., John-      [44] David Kaplan. AMD x86 memory encryption technolo-
+                   son S., Leslie H. R., and Rozas C. Intel software guard        gies. Austin, TX, August 2016. USENIX Association.
+                   extensions (intel sgx) support for dynamic memory man-
+                   agement inside an enclave. Hardware and Architectural     [45] David Kaplan, Jeremy Powell, and Tom Woller. Amd
+                   Support for Security and Privacy, 2016.                        memoryencryption. White paper, 2016.
+             [35] Andrew Ferraiuolo, Andrew Baumann, Chris Haw-              [46] Mustakimur Rahman Khandaker, Yueqiang Cheng, Zhi
+                   blitzel, and Bryan Parno. Komodo: Using verification           Wang,andTaoWei. Coinattacks: On insecurity of en-
+                   to disentangle secure-enclave hardware from software.          clave untrusted interfaces in sgx. In Proceedings of the
+                   In SOSP’17, 2017.                                              Twenty-Fifth International Conference on Architectural
+             [36] Trusted Computing Group. TPM Library Specification              Support for Programming Languages and Operating
+                   2.0, 2016.                                                     Systems, pages 971–985, 2020.
+             [37] Marcus Hähnel, Weidong Cui, and Marcus Peinado.            [47] Avi Kivity, Yaniv Kamay, Dor Laor, Uri Lublin, and An-
+                   High-resolution side channels for untrusted operating          thony Liguori. kvm: the linux virtual machine monitor.
+                   systems. In 2017 USENIXAnnualTechnicalConference               In ProceedingsoftheLinuxsymposium,volume1,pages
+                  (USENIXATC17),pages299–312,2017.                                225–230. Dttawa, Dntorio, Canada, 2007.
+             450    2022 USENIX Annual Technical Conference                                                        USENIX Association
+             [48] Paul Kocher, Jann Horn, Anders Fogh, Daniel Genkin,     [58] AhmadMoghimi,GorkaIrazoqui,andThomasEisen-
+                  Daniel Gruss, Werner Haas, Mike Hamburg, Moritz              barth. Cachezoom: How sgx amplifies the power of
+                  Lipp, Stefan Mangard, Thomas Prescher, et al. Spectre        cache attacks. In International Conference on Crypto-
+                  attacks: Exploiting speculative execution. In 2019 IEEE      graphicHardwareandEmbeddedSystems,pages69–90.
+                  SymposiumonSecurityandPrivacy(SP),pages1–19.                 Springer, 2017.
+                  IEEE, 2019.                                             [59] Daniel Moghimi, Jo Van Bulck, Nadia Heninger, Frank
+             [49] Dayeol Lee, David Kohlbrenner, Shweta Shinde, Krste          Piessens, and Berk Sunar.      Copycat: Controlled
+                          ´                                                    instruction-level attacks on enclaves. In 29th USENIX
+                  Asanovic, and Dawn Song. Keystone: An open frame-
+                  workforarchitecting trusted execution environments. In       Security Symposium (USENIX Security 20), pages 469–
+                  Proceedings of the Fifteenth European Conference on          486, 2020.
+                  ComputerSystems, pages 1–16, 2020.                      [60] OlgaOhrimenko,FelixSchuster,CédricFournet,Aastha
+             [50] Joshua Lind, Christian Priebe, Divya Muthukumaran,           Mehta, Sebastian Nowozin, Kapil Vaswani, and Manuel
+                  Dan O’Keeffe, Pierre-Louis Aublin, Florian Kelbert,          Costa.   Oblivious multi-party machine learning on
+                  Tobias Reiher, David Goltzsche, David Eyers, Rüdiger         trusted processors. In 25th USENIX SecuritySymposium
+                  Kapitza, et al. Glamdring: Automatic application parti-      (USENIXSecurity 16), pages 619–636, 2016.
+                  tioning for intel SGX. In 2017 USENIX Annual Techni-    [61] Meni Orenbach, Pavel Lifshits, Marina Minkin, and
+                  cal Conference (USENIXATC17),pages285–298,2017.              Mark Silberstein. Eleos: Exitless os services for sgx
+             [51] Yutao Liu, Tianyu Zhou, Kexin Chen, Haibo Chen, and          enclaves. In Proceedings of the Twelfth European Con-
+                  Yubin Xia. Thwarting memory disclosure with efficient        ference on Computer Systems, pages 238–253, 2017.
+                  hypervisor-enforced intra-domain isolation. In Proceed- [62] MarkRussinovich. Introducing Azure confidential com-
+                  ings of the 22nd ACM SIGSACConferenceonComputer              puting. Seattle, WA: Microsoft, 2017.
+                  and Communications Security, pages 1607–1619, 2015.
+                                                                          [63] M. Schwarz, S. Weiser, and D. Gruss. Practical enclave
+             [52] Andrei Lutas, Daniel Ticle, and O. Cre¸t. Hypervisor         malwarewithintelsgx. InDIMVA2019,pages177–196,
+                  based memory introspection: Challenges, problems and         2019.
+                  limitations. In ICISSP, 2017.                           [64] Youren Shen, Hongliang Tian, Yu Chen, Kang Chen,
+             [53] Uwe F. Mayer. Linux/Unix nbench. https://www.                Runji Wang, Yi Xu, Yubin Xia, and Shoumeng Yan. Oc-
+                  math.utah.edu/~mayer/linux/bmark.html,2017.                  clum: Secure and efficient multitasking inside a single
+                                                                               enclave of Intel SGX. In Proceedings of the Twenty-
+             [54] Jonathan M. McCune, Yanlin Li, Ning Qu, Zongwei              Fifth International Conference on Architectural Support
+                  Zhou, AnupamDatta, V. Gligor, and A. Perrig. Trustvi-        for Programming Languages and Operating Systems,
+                  sor: Efficient tcb reduction and attestation. 2010 IEEE      pages 955–970, 2020.
+                  Symposium on Security and Privacy, pages 143–158,       [65] Shweta Shinde, Shengyi Wang, Pinghai Yuan, Aquinas
+                  2010.                                                        Hobor, Abhik Roychoudhury, and Prateek Saxena.
+             [55] FrankMcKeen,IlyaAlexandrovich,AlexBerenzon,Car-              Besfs: A POSIX filesystem for enclaves with a mecha-
+                  los V Rozas, Hisham Shafi, Vedvyas Shanbhogue, and           nizedsafetyproof. In 29thUSENIXSecuritySymposium
+                  UdayRSavagaonkar. Innovative Instructions and Soft-          (USENIXSecurity 20), pages 523–540, 2020.
+                  ware Model for Isolated Execution. Hasp, isca, 10(1),   [66] Hongliang Tian, Qiong Zhang, Shoumeng Yan, Alex
+                  2013.                                                        Rudnitsky, Liron Shacham, Ron Yariv, and Noam Mil-
+             [56] Larry McVoy and Carl Staelin. lmbench: Portable tools        shten. Switchless calls made practical in Intel SGX. In
+                  for performance analysis. In USENIX 1996 Annual              Proceedings of the 3rd Workshop on System Software
+                  Technical Conference (USENIX ATC 96), San Diego,             for Trusted Execution, pages 22–27, 2018.
+                  CA,January1996. USENIXAssociation.                      [67] Chia-Che Tsai, Donald E Porter, and Mona Vij.
+             [57] Jämes Ménétrey, Marcelo Pasin, Pascal Felber, and Va-        Graphene-sgx: Apractical library OS for unmodified ap-
+                  lerio Schiavoni. Twine: An embedded trusted runtime          plications on SGX. In 2017 USENIX Annual Technical
+                  for webassembly. In 2021 IEEE 37th International Con-        Conference (USENIXATC 17), pages 645–658, 2017.
+                  ference on Data Engineering (ICDE), pages 205–216.      [68] Chia-Che Tsai, Jeongseok Son, Bhushan Jain, John
+                  IEEE, 2021.                                                  McAvey,RalucaAdaPopa,andDonaldEPorter. Civet:
+             USENIX Association                                                    2022 USENIX Annual Technical Conference    451
+                   Anefficientjavapartitioningframeworkforhardwareen-          A SupplementaryMaterials
+                   claves. In 29th USENIX Security Symposium (USENIX
+                   Security 20), pages 505–522, 2020.                          A.1    MappingAttacks
+              [69] Jo Van Bulck, David Oswald, Eduard Marin, Abdulla           See Figure 9.
+                   Aldoseri, Flavio D Garcia, and Frank Piessens. A tale
+                   of two worlds: Assessing the vulnerability of enclave
+                   shielding runtimes. In Proceedings of the 2019 ACM
+                   SIGSACConferenceonComputerandCommunications                 A.2    Virtualization Overhead
+                   Security, pages 1741–1758, 2019.
+              [70] JoVanBulck,FrankPiessens,andRaoulStrackx. Neme-             We’dliketoevaluatethevirtualizationoverheadonthenormal
+                   sis: Studying microarchitectural timing leaks in rudi-      VM.WeranSPECCPU2017INTSpeedbenchmarks[31],
+                   mentary cpu interrupt logic. In Proceedings of the 2018     LMBench[56],andLinuxkernel(v5.15)building when en-
+                   ACMSIGSACConferenceonComputerandCommuni-                    abled and disabled RustMonitor. The result shows that the
+                   cations Security, pages 178–195, 2018.                      virtualization overhead is less than 1% in most benchmarks
+                                                                               (see Figure 10 and Table 3). HyperEnclave avoids massive
+              [71] Huibo Wang, Pei Wang, Yu Ding, Mingshen Sun, Yim-           VM-exits by pass-through most devices to the normal VM
+                   ing Jing, Ran Duan, Long Li, Yulong Zhang, Tao Wei,         and installs huge pages in NPT when possible to relieve the
+                   and Zhiqiang Lin. Towards memory safe enclave pro-          TLBpressure.
+                   grammingwithrust-sgx. Proceedings of the 2019 ACM
+                   SIGSACConferenceonComputerandCommunications                                          LMbench(µs)                Kernel
+                   Security, 2019.                                                         null                      Page   AF    Build (s)
+                                                                                           call   fork  ctxsw mmap Fault   UNIX
+              [72] Wenhao Wang, Guoxing Chen, Xiaorui Pan, Yinqian                  Native 0.1195 196.3 3.13  66,125 0.2433 5.73   1,410
+                   Zhang, XiaoFeng Wang, Vincent Bindschaedler, Haixu           NormalVM 0.1192 197.9   3.22  66,407 0.2461 5.69   1,417
+                   Tang, and Carl A Gunter. Leaky cauldron on the dark           Overhead -0.25% 0.82% 2.88% 0.43% 1.15% -0.70%    0.50%
+                   land: Understanding memory side-channel hazards in
+                   sgx. In Proceedings of the 2017 ACM SIGSAC Confer-          Table 3: Virtualization overhead on LMBench (null syscall,
+                   ence on Computer and Communications Security, pages         fork, context switches among 16 processes with 64KB work-
+                   2421–2434, 2017.                                            ing set, mmap, page fault, and unix socket) and building the
+                                                                               Linux kernel.
+              [73] Ofir Weisse, Valeria Bertacco, and Todd Austin. Re-
+                   gaining lost cycles with hotcalls: A fast interface for sgx
+                   secure enclaves. In 2017 ACM/IEEE 44th Annual Inter-
+                   national Symposium on Computer Architecture (ISCA),
+                   pages 81–93. IEEE, 2017.                                    A.3    MemoryEncryptionOverhead
+              [74] Yuanzhong Xu, Weidong Cui, and Marcus Peinado.              Weevaluate the memory encryption overhead by measuring
+                   Controlled-channel attacks: Deterministic side channels     the memory access latency with and without encryption in
+                   for untrusted operating systems. In 2015 IEEE Sympo-        sequential and random access patterns. The buffer size is
+                   sium on Security and Privacy, pages 640–656. IEEE,          varied from 16 KB to 256 MB. Figure 11 illustrates the result
+                   2015.                                                       onHyperEnclaveandSGX.Whenthebuffersizeissmaller
+                                                                               than the LLC size (8 MB), the overhead on both platforms
+              [75] MinhongYunandLinZhong. Ginseng:Keepingsecrets               is negligible. When the buffer size is over the LLC size, the
+                   in registers when you distrust the operating system. In     overhead for sequential accesses and random accesses can
+                   NDSS,2019.                                                  be over 2.4× and 25× respectively on HyperEnclave, while
+                                                                               on SGX is 3× and 30× respectively. When the buffer size
+              [76] Shijun Zhao, Qianying Zhang, Yu Qin, Wei Feng, and          exceeds the EPC size (93 MB), the overhead for sequential
+                   DengguoFeng. Sectee: A software-based approach to           accesses and random accesses is 45× and 1000× slow on
+                   secure enclave architecture using TEE. Proceedings of       SGX,duetotheEPCpageswapping,whileonHyperEnclave
+                   the 2019 ACM SIGSAC Conference on Computer and              the overhead is still less than 30× since we reserve 24GB as
+                   Communications Security, 2019.                              enclave memory in our test.
+              452    2022 USENIX Annual Technical Conference                                                          USENIX Association
+                                        Virtual memory view                             Physical memory
+                                                                                                                                                        Enclave virtual
+                                                                                                                                                                                            Physical memory
+                                                                                                                                                         memory view
+                                               ELRANGE
+                                                                                                                                                                          Normal mapping
+                                                                                                                           Enclave's code
+                                                                                                                                                           ELRANGE                                 EPC
+                           Enclave-A              vaddr
+                                                                                                                          write(vaddr, 'a');
+                                                                                                EPC
+                                                                                                                                                             vaddr                                paddr
+                                                                                                paddr
+                                                                                                                                                                            Compromised
+                                                                                                                           Enclave's code
+                                               ELRANGE
+                                                                                                                                                                                                   EPC
+                                                                                                                                                                              mapping
+                                                                                                                                                           ELRANGE
+                                                                                                                                                                                                  paddr'
+                           Enclave-B              vaddr'
+                                                                                                                          write(vaddr, 'a');
+                                                                   Compromised
+                                                                                                                                                             vaddr
+                                                                       mapping
+                                                    (a) Alias mapping attack                                                                         (b) Remapping attack
+                     Figure 9: Mapping attacks. (a) Two guest virtual addresses within the enclaves are mapped to the same guest physical address;
+                     (b) A non-enclave virtual address is mapped to the physical address belonging to the enclave.
+                                                                                                                         B ArtifactAppendix
+                                                         Native           Normal VM
+                                                0.2%                                                                     Abstract
+                        800
+                                                                                      -0.2%
+                       (s)               0.8%
+                                                        3.7%                                                             HyperEnclave can support existing SGX toolchains and run
+                                                                                             -0.3%
+                                                                              1.6%
+                                 0.4%
+                       time600
+                                                                       -0.1%                                             SGXapplications on AMD CPU with security guarantees.
+                                                                                                     0.2%
+                       ecution                                 1.2%                                                      Thisartifact contains the binaries of the RustMonitor,and doc-
+                       Ex400                                                                                             umentations on how to setup the HyperEnclave environment.
+                                                                                                                         Weprovide two containers to reduce the environment con-
+                        200            gcc_s   mcf_s                x264_s         leela_s           xz_s                figuration efforts. Specifically, the server container includes
+                                                 omnetpp_s                             change2_s                         the pre-installed enclave SDK, the Occlum LibOS, and the
+                          perlbench_s                  xalancbmk_s     deepsjeng_s    x
+                                                                                     e
+                                                                                                                         benchmarks along with their dependencies5. The client con-
+                        Figure 10: Virtualization overhead on SPEC CPU 2017.                                             tainer includes pre-installed client side benchmark scripts for
+                                                                                                                         Lighttpd and Redis.
+                                    sequential reads (plaintext, baseline)         randomreads (encrypted)               Scope
+                                    sequential reads (encrypted)
+                                                                              LLC size
+                            1000                                                                                         Theartifact includes benchmarks for edge calls (i.e., ECALLs
+                                         HyperEnclave                                                                    and OCALLs),andbenchmarksforthereal-world workloads,
+                             100
+                                                                                                                         including NBench, SQLite, Lighttpd and Redis. We provide
+                              10                                                                                         scripts to reproduce the results in the paper (summarized in
+                               1                                                                                         Table 4).
+                         malized)
+                                                                1M        4M
+                                  16K       64K      256K                     8M 16M        64M       256M
+                         (nor
+                                                                              LLC size    available EPC size
+                            1000                                                                                         Contents
+                                         Intel SGX
+                         Latency
+                             100                                                                                         • README.mddescribes the artifact and provides a road map
+                                                                                                                            for evaluation.
+                              10
+                               1                                                                                         • host/contains RustMonitor binary, the Linux kernel mod-
+                                                                                                                            ule binary, and the scripts to install and enable HyperEn-
+                                                                1M        4M
+                                  16K       64K      256K                     8M 16M        64M       256M
+                                                            Buffer size                                                     clave.
+                     Figure 11: Memory encryption overhead for sequential and                                            • server/contains the source code (or patches) and scripts
+                     randommemoryaccessesonHyperEnclave(withAMDSME)                                                         of all experiments to run within the enclaves. We also pro-
+                     and Intel SGX (with Intel MEE). The LLC size is 8 MB, and                                              vide a docker container with all dependencies installed.
+                     the available EPC size on Intel SGX is about 93 MB.                                                     5The artifact is based on SGX SDK v2.15, Occlum LibOS v0.27, and
+                                                                                                                         GCC9.4.0.Theversions have little effect on the performance results.
+                     USENIX Association                                                                                                 2022 USENIX Annual Technical Conference    453
+                Experiments   Figure/Table  Whichcontainer    Estimated time                         Description
+                 edge-calls     Table 1          server            10s            Thelatency of EENTER/EEXIT and ECALLs/OCALLs.
+                 exception      Table 2          server            20s                   Handling exceptions inside the enclaves.
+                  NBench       Figure 8a         server            10m              Performance scores of NBench inside the enclaves.
+                  SQLite       Figure 8b         server            15m           Throughput of in-memory SQLite database with different
+                                                                                      numberofrecords, under YCSB A workload.
+                  Lighttpd     Figure 8c      server/client        10m         Throughput of Lighttpd web server inside Occlum LibOS with
+                                                                                                 different request sizes.
+                                                                               Latency-throughput curve of Redis in-memory database server
+                   Redis       Figure 8d      server/client        20m           inside Occlum LibOS with increasing request frequencies.
+                                                                                           Theclient uses YCSB A workload.
+                                             Table 4: Summary of the benchmarks included in the artifact.
+              • client/containsthebenchmarkscriptsfornetwork-based
+                experiments (Lighttpd and Redis) to run on the client side.
+               Wealsoprovideadockercontainer with all dependencies
+                installed.
+              • plots/ contains plotting scripts to generate figures from
+                the experiment results.
+              • paper-results/contains the results shown in the paper.
+              Hosting
+              Check out https://github.com/HyperEnclave/atc22-ae (tag:
+              atc22-ae, commit ID: d1be8ab).
+              Requirements
+              Hardwarerequirements:
+              • A 64-bit AMD platform with SVM enabled. Optionally,
+               werecommendthattheplatformshouldsupportSMEfor
+                the protection against physical memory attacks.
+              • RAM≥16GB.
+              • Free disk space ≥ 30 GB.
+              Wedisabled TPMandIOMMUfeaturesinRustMonitorbi-
+              nary for artifact evaluation to minimize the hardware require-
+              ments. These features do not affect the performance results.
+              Software requirements:
+              • Linux    with   the   specified  kernel   version   (i.e.,
+                5.3.0-28-generic) to match our given kernel module
+                binary. We recommend Ubuntu 18.04.4 LTS which uses
+                this version of kernel as the default.
+              • Docker.
+              • Git.
+              • GCCandLinuxkernelheaders(forbuilding the enable_
+                rdfsbasekernel module).
+              454    2022 USENIX Annual Technical Conference                                                        USENIX Association
